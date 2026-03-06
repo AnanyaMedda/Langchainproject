@@ -1,0 +1,21 @@
+import asyncio
+import sys
+sys.path.append(r"c:\Users\anany\tron\apps\api\src")
+from modules.agent.tools import execute_duckduckgo_search
+
+queries = [
+    "best rooftop restaurants in kolkata",
+    "veg restaurants in delhi",
+    "romantic restaurants in mumbai",
+    "buffet restaurants bangalore"
+]
+
+async def main():
+    for q in queries:
+        print(f"=== Testing Query: {q} ===")
+        res = await execute_duckduckgo_search(q)
+        print(res)
+        print("\n" + "="*50 + "\n")
+
+if __name__ == "__main__":
+    asyncio.run(main())
