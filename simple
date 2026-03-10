@@ -1,0 +1,197 @@
+import re
+import urllib.parse
+import asyncio
+from typing import List, Tuple
+from bs4 import BeautifulSoup
+
+from pydantic import HttpUrl
+from langchain.tools import tool
+from playwright.async_api import async_playwright
+
+
+AGGREGATOR_BLOCKLIST = [
+    "tripadvisor",
+    "zomato",
+    "justdial",
+    "restaurantguru",
+    "facebook",
+    "instagram",
+    "maps",
+    "directories",
+]
+
+
+def is_aggregator(url: str) -> bool:
+    url = url.lower()
+    return any(bad in url for bad in AGGREGATOR_BLOCKLIST)
+
+
+async def duckduckgo_search(query: str, limit: int = 10) -> List[str]:
+    """
+    Use Playwright to perform DuckDuckGo search and return top organic result links.
+    """
+    links = []
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        page = await browser.new_page()
+
+        encoded = urllib.parse.quote(query)
+        search_url = f"https://duckduckgo.com/?q={encoded}"
+        await page.goto(search_url, timeout=60000)
+
+        # Wait for results to appear
+        await page.wait_for_selector("a.result__a", timeout=15000)
+
+        elements = await page.query_selector_all("a.result__a")
+        for el in elements:
+            href = await el.get_attribute("href")
+            if href:
+                links.append(href)
+            if len(links) >= limit:
+                break
+
+        await browser.close()
+
+    return links
+
+
+async def fetch_page_content(url: str) -> str:
+    """
+    Use Playwright to fetch raw HTML from a URL.
+    """
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        page = await browser.new_page()
+
+        try:
+            await page.goto(url, timeout=60000)
+            html = await page.content()
+        except:
+            html = ""
+        finally:
+            await browser.close()
+
+    return html
+
+
+def extract_restaurant_names(html: str, limit: int = 5) -> List[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    names = []
+
+    tags = soup.find_all(["h1", "h2", "h3", "li"])
+    for tag in tags:
+        text = tag.get_text(" ", strip=True)
+        if not text:
+            continue
+
+        # Clean up text
+        text = re.split(r"[:\-–]", text)[0].strip()
+
+        # Skip generic category labels
+        if any(word in text.lower() for word in ["restaurant", "food", "dining", "cuisine"]):
+            continue
+
+        # Basic sanity check
+        if len(text.split()) > 6:
+            continue
+
+        # Collect
+        if text not in names:
+            names.append(text)
+
+        if len(names) >= limit:
+            break
+
+    return names
+
+
+async def find_official_website(name: str, city: str) -> str:
+    query = f"{name} restaurant {city} official website"
+    results = await duckduckgo_search(query, limit=10)
+
+    for url in results:
+        if not is_aggregator(url):
+            return url
+
+    return ""
+
+
+async def crawl_restaurant_website(url: str) -> str:
+    """
+    Use Playwright to extract text from the restaurant website.
+    """
+    html = await fetch_page_content(url)
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text(separator=" ", strip=True)
+    words = text.split()
+    return " ".join(words[:400])
+
+
+@tool
+async def search_top_restaurants(query: str) -> str:
+    """
+    Tool: Finds top 5 restaurants from a query like:
+    "find top 5 restaurants in kolkata"
+    """
+
+    # Extract city name heuristically
+    m = re.search(r"in\s+([a-zA-Z\s]+)", query.lower())
+    city = m.group(1).strip() if m else "city"
+
+    # STEP 1 — DuckDuckGo search
+    search_results = await duckduckgo_search(query, limit=10)
+
+    # STEP 2 — pick first non‑aggregator article
+    article_url = ""
+    for url in search_results:
+        if not is_aggregator(url):
+            article_url = url
+            break
+
+    if not article_url:
+        return "No suitable article found."
+
+    # Fetch article HTML
+    article_html = await fetch_page_content(article_url)
+
+    # STEP 3 — Extract restaurant names
+    restaurants = extract_restaurant_names(article_html, limit=5)
+
+    if not restaurants:
+        return "No restaurant names could be extracted."
+
+    # STEP 4–6 — For each restaurant get website & extract content
+    output_lines = []
+    counter = 1
+
+    for name in restaurants:
+        official_url = await find_official_website(name, city)
+
+        if not official_url:
+            content = "Official website not found."
+        else:
+            content = await crawl_restaurant_website(official_url)
+
+        block = [
+            f"Restaurant {counter}",
+            f"Name: {name}",
+            f"URL: {official_url if official_url else 'N/A'}",
+            f"Content: {content}",
+            ""
+        ]
+        output_lines.extend(block)
+        counter += 1
+
+    return "\n".join(output_lines)
+
+
+async def main():
+    query = "find top 5 restaurants in kolkata"
+    result = await search_top_restaurants(query)
+    print(result)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
