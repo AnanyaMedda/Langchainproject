@@ -1,0 +1,97 @@
+knowledgebase/sitemap.py-
+import logging
+from typing import Tuple
+from urllib.request import Request, urlopen
+from urllib.parse import urlparse
+from xml.etree import ElementTree as ET
+from lxml import html
+
+logger = logging.getLogger(__name__)
+
+def get_base_url_and_sitemap(url: str) -> Tuple[str, str]:
+    p = urlparse(url)
+    return f"{p.scheme}://{p.netloc}", f"{p.scheme}://{p.netloc}/sitemap.xml"
+
+def fetch_sitemap_urls(sitemap_url: str, filter_prefix: str) -> list[str]:
+    try:
+        with urlopen(Request(sitemap_url, headers={'User-Agent': 'Mozilla/5.0'}, method="GET"), timeout=10) as res:
+            return list({e.text.strip() for e in ET.fromstring(res.read()).iter() 
+                         if 'loc' in e.tag and e.text and e.text.strip().startswith(filter_prefix)})
+    except Exception as e:
+        logger.error(f"Sitemap fetch failed for {sitemap_url}: {e}")
+        return [filter_prefix]
+
+def fetch_and_extract_text(url: str) -> str:
+    try:
+        with urlopen(Request(url, headers={'User-Agent': 'Mozilla/5.0'}), timeout=10) as res:
+            tree = html.fromstring(res.read())
+            for elem in tree.xpath('//script | //style | //nav | //footer'):
+                elem.drop_tree()
+            return ' '.join(tree.text_content().split())
+    except Exception as e:
+        logger.error(f"Extraction failed for {url}: {e}")
+        return ""
+
+controller.py-
+async def ingest_url_to_knowledge_base(
+        self, id: UUID, user: User, url: str, file_controller: FileController
+    ):
+        base_url, sitemap_url = get_base_url_and_sitemap(url)
+        urls = fetch_sitemap_urls(sitemap_url, filter_prefix=url)
+        cuid_generator = cuid_wrapper()
+
+        extracted_files = []
+        for target_url in urls:
+            text = fetch_and_extract_text(target_url)
+            if not text:
+                continue
+
+            content = text.encode("utf-8")
+            file_name = "scraped_page"
+            file_extension = "txt"
+            new_file_name = f"{file_name}_{cuid_generator()}.{file_extension}"
+
+            file_path = file_controller._get_local_file_path(new_file_name)
+            dir_path = file_path.parent
+            if not dir_path.exists():
+                dir_path.mkdir(parents=True, exist_ok=True)
+
+            async with aiofiles.open(file_path, "wb") as saved_file:
+                await saved_file.write(content)
+
+            document = FileCreate(
+                filename=new_file_name,
+                original_filename=target_url,
+                content_type="text/plain",
+                content_length=len(content),
+                owner_id=user.id,
+                is_private=False,
+            )
+            created_file = file_controller.create(File.model_validate(document))
+            extracted_files.append(created_file)
+
+        if extracted_files:
+            self.attach_file_to_knowledge_base(id, user, extracted_files)
+            await self.enqueue_knowledge_base_for_extraction(id, user)
+
+        return self.get_knowledge_base(id, user)
+knowlegaebase-router.py-
+@router.post(
+    "/{id}/url",
+    response_model=KnowledgeBase,
+    dependencies=[guard("feature:knowledge-base")],
+)
+async def ingest_url_to_knowledge_base(
+    user: CurrentUser,
+    controller: KnowledgeBaseControllerDeps,
+    id: UUID,
+    body: URLIngestRequest,
+    file_controller: FileControllerDeps,
+):
+    return await controller.ingest_url_to_knowledge_base(
+        id, user, body.url, file_controller
+    )
+
+schema.py-
+class URLIngestRequest(SQLModel):
+    url: str
