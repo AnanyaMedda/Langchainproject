@@ -536,3 +536,17 @@ const WebIngester = ({ className }: { className?: string }) => {
 };
 
 export default WebIngester;
+
+
+export const useIngestScrapedResults = () => {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async ({ id, results }: any) => ingestScrapedResults(id, results),
+    onSuccess: async (res: any) => {
+      await queryClient.invalidateQueries({ queryKey: ['knowledge-base', res?.id] });
+      await queryClient.invalidateQueries({ queryKey: ['knowledge-base', res?.slug] });
+      await queryClient.invalidateQueries({ queryKey: ['knowledge-base-files', res?.id] });
+    },
+  });
+};
