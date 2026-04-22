@@ -1,0 +1,370 @@
+wknowledgebase-
+import { type ChangeEvent, useMemo, useState } from 'react';
+import { useForm } from 'react-hook-form';
+import { yupResolver } from '@hookform/resolvers/yup';
+import { Badge, Button, Checkbox, Loader, Skeleton, Table, Text, TextInput, Select, Progress } from '@mantine/core';
+import * as yup from 'yup';
+import useWebSocket, { ReadyState } from 'react-use-websocket';
+import { Icon } from '@iconify/react';
+import { notifications } from '@mantine/notifications';
+
+import { cn } from '@/lib/utils';
+import { useDiscoverUrls } from '@/apis/queries/scrapper.queries';
+import { useKnowledgeBases, useIngestScrapedResults } from '@/apis/queries/knowledge-base.queries';
+
+const API_URL = import.meta.env.VITE_API_URL_BASE;
+const WS_URL = `ws://${API_URL}/api/scrapper/extract-attributes`;
+
+const schema = yup.object({
+  url: yup.string().required('Required').url(),
+});
+
+interface IScrapeResult {
+  url: string;
+  result: string;
+  attributes: {
+    page_type: string;
+    page_content: string;
+    customer_persona: string;
+  };
+}
+
+interface WebIngesterProps {
+  className?: string;
+}
+
+const WebIngester: React.FC<WebIngesterProps> = ({ className }) => {
+  const form = useForm({
+    resolver: yupResolver(schema),
+    defaultValues: { url: 'https://example.com' },
+  });
+
+  const discoverUrls = useDiscoverUrls();
+  const ingestResults = useIngestScrapedResults();
+  
+  // Knowledge Bases
+  const knowledgeBasesQuery = useKnowledgeBases({ page: 0, limit: 100 });
+  const knowledgeBases = useMemo(() => {
+    if (!knowledgeBasesQuery.data) return [];
+    return knowledgeBasesQuery.data.data.map((kb) => ({
+      value: kb.id,
+      label: kb.name,
+    }));
+  }, [knowledgeBasesQuery.data]);
+
+  const [selectedKb, setSelectedKb] = useState<string | null>(null);
+
+  // Discovery State
+  const [urls, setUrls] = useState<string[]>([]);
+  const [selectedUrls, setSelectedUrls] = useState<string[]>([]);
+  const [mode, setMode] = useState<'initial' | 'discovery' | 'extraction'>('initial');
+
+  // Extraction State
+  const [results, setResults] = useState<Array<IScrapeResult>>([]);
+  const [isExtracting, setIsExtracting] = useState(false);
+
+  const handleSubmit = form.handleSubmit((data) => {
+    setUrls([]);
+    discoverUrls.mutate(data.url, {
+      onSuccess: (data) => {
+        setUrls(data);
+        setMode('discovery');
+        setSelectedUrls([]);
+        setResults([]);
+      },
+    });
+  });
+
+  const handleSelectAll = (event: ChangeEvent<HTMLInputElement>) => {
+    if (event.target.checked) {
+      setSelectedUrls(urls);
+    } else {
+      setSelectedUrls([]);
+    }
+  };
+
+  const { readyState, sendJsonMessage } = useWebSocket(
+    WS_URL,
+    {
+      share: false,
+      shouldReconnect: () => false,
+      onClose: (event) => {
+        setIsExtracting(false);
+      },
+      onMessage(event) {
+        const message = JSON.parse(event.data as string) as IScrapeResult;
+        setResults((prev) => [...prev, message]);
+      },
+      onOpen: () => {
+        setResults([]);
+      },
+    },
+    selectedUrls.length > 0
+  );
+
+  const webSocketStatusColor = useMemo(() => {
+    switch (readyState) {
+      case ReadyState.UNINSTANTIATED: return 'gray';
+      case ReadyState.CONNECTING: return 'blue';
+      case ReadyState.CLOSING: return 'yellow';
+      case ReadyState.CLOSED: return 'red';
+      case ReadyState.OPEN: return 'green';
+      default: return 'gray';
+    }
+  }, [readyState]);
+
+  const handleExtract = () => {
+    if (!selectedKb) {
+      notifications.show({ color: 'red', message: 'Please select a Knowledge Base first.' });
+      return;
+    }
+    setMode('extraction');
+    setIsExtracting(true);
+    sendJsonMessage({ urls: selectedUrls });
+  };
+
+  const handleIngest = () => {
+    if (!selectedKb || results.length === 0) return;
+    
+    ingestResults.mutate(
+      { 
+        id: selectedKb as string, 
+        results: results.map((r) => ({ url: r.url, result: r.result })) 
+      },
+      {
+        onSuccess: () => {
+          notifications.show({
+            color: 'green',
+            title: 'Success',
+            message: 'Web content successfully ingested into the Knowledge Base!',
+          });
+        },
+        onError: (err: any) => {
+          notifications.show({
+            color: 'red',
+            title: 'Error',
+            message: err.message || 'An error occurred',
+          });
+        }
+      }
+    );
+  };
+
+  return (
+    <div className={cn(className, 'flex flex-col')}>
+      <form onSubmit={handleSubmit} className="mb-7 flex gap-4">
+        <TextInput
+          placeholder="https://example.com"
+          radius="lg"
+          type="url"
+          {...form.register('url')}
+          disabled={discoverUrls.isPending || isExtracting}
+          className="flex-1"
+        />
+        <Button type="submit" radius="lg" loading={discoverUrls.isPending} disabled={isExtracting}>
+          Discover
+        </Button>
+      </form>
+
+      {discoverUrls.isPending && (
+        <div className="my-4 flex items-center gap-4">
+          <p className="text-xs">Discovering URLs...</p>
+          <Loader size="xs" />
+        </div>
+      )}
+
+      {mode !== 'initial' && !discoverUrls.isPending && (
+        <div className="flex flex-col overflow-auto">
+          <div className="mb-4 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+            <div className="flex items-center gap-3">
+              <Text size="sm">URLs Found:</Text>
+              <Badge variant="light">{urls.length}</Badge>
+            </div>
+            <div className="flex items-center gap-3">
+              <Text size="sm">Selected:</Text>
+              <Badge variant="light">{selectedUrls.length}</Badge>
+            </div>
+            <div className="col-span-2 flex items-center gap-2">
+              <Select
+                placeholder="Select Target Knowledge Base"
+                data={knowledgeBases}
+                value={selectedKb}
+                onChange={setSelectedKb}
+                className="flex-1"
+                disabled={isExtracting}
+              />
+            </div>
+          </div>
+
+          <div className="mb-7 flex flex-wrap gap-4 items-center">
+            {mode === 'extraction' && (
+              <Badge color={webSocketStatusColor} leftSection={<Icon icon="mdi:circle" className="text-xs" />}>
+                {ReadyState[readyState]}
+              </Badge>
+            )}
+
+            <div className="ml-auto flex gap-3">
+              <Button
+                type="button"
+                radius="lg"
+                disabled={selectedUrls.length === 0 || !selectedKb || isExtracting}
+                onClick={handleExtract}
+              >
+                Scrape & Ingest ({selectedUrls.length})
+              </Button>
+
+              {results.length > 0 && !isExtracting && (
+                <Button
+                  type="button"
+                  radius="lg"
+                  color="green"
+                  leftSection={<Icon icon="solar:database-bold-duotone" />}
+                  onClick={handleIngest}
+                  loading={ingestResults.isPending}
+                >
+                  Save into Knowledge Base
+                </Button>
+              )}
+            </div>
+          </div>
+
+          {isExtracting && (
+            <Progress mb="lg" value={(results.length / selectedUrls.length) * 100 || 1} animated />
+          )}
+
+          {mode === 'discovery' && (
+            <Table.ScrollContainer minWidth={500}>
+              <Table stickyHeader stickyHeaderOffset={0}>
+                <Table.Thead>
+                  <Table.Tr>
+                    <Table.Th><Checkbox onChange={handleSelectAll} /></Table.Th>
+                    <Table.Th>URL</Table.Th>
+                  </Table.Tr>
+                </Table.Thead>
+                <Table.Tbody>
+                  {urls.map((url) => (
+                    <Table.Tr key={url}>
+                      <Table.Td>
+                        <Checkbox
+                          checked={selectedUrls.includes(url)}
+                          onChange={(event) => {
+                            if (event.target.checked) setSelectedUrls((prev) => [...prev, url]);
+                            else setSelectedUrls((prev) => prev.filter((i) => i !== url));
+                          }}
+                        />
+                      </Table.Td>
+                      <Table.Td>{url}</Table.Td>
+                    </Table.Tr>
+                  ))}
+                </Table.Tbody>
+              </Table>
+            </Table.ScrollContainer>
+          )}
+
+          {results.length > 0 && (
+            <Table.ScrollContainer minWidth={500}>
+              <Table stickyHeader stickyHeaderOffset={0}>
+                <Table.Thead>
+                  <Table.Tr>
+                    <Table.Th>URL</Table.Th>
+                    <Table.Th>Status</Table.Th>
+                  </Table.Tr>
+                </Table.Thead>
+                <Table.Tbody>
+                  {results.map((item) => (
+                    <Table.Tr key={item.url}>
+                      <Table.Td>{item.url}</Table.Td>
+                      <Table.Td><Badge color="green">Extracted</Badge></Table.Td>
+                    </Table.Tr>
+                  ))}
+                </Table.Tbody>
+              </Table>
+            </Table.ScrollContainer>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default WebIngester;
+
+
+pages/webscapper-
+import WebIngester from '@/components/modules/knowledge-bases/WebIngester';
+import { Title, Text } from '@mantine/core';
+
+const WebScraperPage = () => {
+  return (
+    <div className="flex flex-col h-full">
+      <div className="mb-6">
+        <Title order={2}>Web Scraper & Ingester</Title>
+        <Text c="dimmed">Discover URLs on a website, extract reading content from them, and ingest them directly into your Knowledge Base.</Text>
+      </div>
+      <main className="flex-1 overflow-hidden">
+        <WebIngester className="w-full h-full" />
+      </main>
+    </div>
+  );
+};
+
+export default WebScraperPage;
+
+
+file_storage/contro-
+async def create_file_from_content(self, user_id: UUID, original_filename: str, content: str, content_type: str = "text/markdown"):
+        file_name = original_filename.split(".")[0]
+        file_extension = original_filename.split(".")[-1] if "." in original_filename else "md"
+        new_file_name = f"{file_name.replace(' ', '_')}_{cuid_generator()}.{file_extension}"
+
+        file_path = self._get_local_file_path(new_file_name)
+        dir_path = file_path.parent
+
+        if not dir_path.exists():
+            dir_path.mkdir(parents=True, exist_ok=True)
+
+        async with aiofiles.open(file_path, "wb") as saved_file:
+            content_bytes = content.encode('utf-8')
+            await saved_file.write(content_bytes)
+            await saved_file.close()
+
+            document = FileCreate(
+                filename=new_file_name,
+                original_filename=original_filename,
+                content_type=content_type,
+                content_length=len(content_bytes),
+                owner_id=user_id,
+                is_private=False,
+            )
+
+            document = File.model_validate(document)
+
+            return super().create(document)
+
+knowbase/control-
+async def ingest_scraped_results(self, id: UUID, user: User, payload: IngestScrapedRequest, file_controller: FileController):
+        files_to_attach = []
+        for result in payload.results:
+            from urllib.parse import urlparse
+            parsed_url = urlparse(result.url)
+            # Create a simple filename from the url path, trunacting to 100 max chars
+            path = parsed_url.path.strip("/").replace("/", "_") or "index"
+            base_name = f"{parsed_url.netloc}_{path}"[:100]
+            original_filename = f"{base_name}.md"
+
+            # Create file
+            file = await file_controller.create_file_from_content(
+                user_id=user.id,
+                original_filename=original_filename,
+                content=result.result,
+                content_type="text/markdown"
+            )
+            files_to_attach.append(file)
+        
+        # Attach to knowledge base
+        self.attach_file_to_knowledge_base(id, user, files_to_attach)
+        
+        # Trigger extraction vector embedding
+        await self.enqueue_knowledge_base_for_extraction(id, user)
+        return self.get_knowledge_base(id, user)
+
