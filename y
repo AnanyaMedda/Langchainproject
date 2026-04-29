@@ -456,3 +456,286 @@ const WebIngester = ({ className }: { className?: string }) => {
 };
 
 export default WebIngester;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { useForm } from 'react-hook-form';
+import { Badge, Button, Checkbox, Loader, Progress, Select, Table, Text, TextInput } from '@mantine/core';
+import { notifications } from '@mantine/notifications';
+
+import { cn } from '@/lib/utils';
+import { useDiscoverUrls } from '@/apis/queries/scrapper.queries';
+import { useKnowledgeBases, useIngestScrapedResults } from '@/apis/queries/knowledge-base.queries';
+import type { IKnowledgeBase } from '@/types';
+
+type WsStatus = 'idle' | 'connecting' | 'open' | 'closed';
+
+const WebIngester = ({ className }: { className?: string }) => {
+  const [urls, setUrls] = useState<string[]>([]);
+  const [selectedUrls, setSelectedUrls] = useState<string[]>([]);
+  const [selectedKb, setSelectedKb] = useState<string | null>(null);
+  const [results, setResults] = useState<Array<{ url: string; result: string }>>([]);
+  const [isExtracting, setIsExtracting] = useState(false);
+  const [mode, setMode] = useState<'initial' | 'discovery' | 'extraction'>('initial');
+  const [wsStatus, setWsStatus] = useState<WsStatus>('idle');
+
+  const wsRef = useRef<WebSocket | null>(null);
+
+  // Build WS URL — same pattern as UrlExtraction.tsx
+  const WS_URL = `ws://${import.meta.env.VITE_API_URL_BASE}/api/scrapper/extract-attributes`;
+
+  // Clean up WebSocket on unmount
+  useEffect(() => {
+    return () => {
+      wsRef.current?.close();
+    };
+  }, []);
+
+  const { register, handleSubmit: handleFormSubmit } = useForm({
+    defaultValues: { url: 'https://' },
+  });
+
+  const discoverUrls = useDiscoverUrls();
+  const ingestResults = useIngestScrapedResults();
+  const knowledgeBasesQuery = useKnowledgeBases({ page: 0, limit: 100 });
+
+  const kbData = useMemo(() => {
+    const response = knowledgeBasesQuery.data as { data: IKnowledgeBase[] } | IKnowledgeBase[] | undefined;
+    let items: IKnowledgeBase[] = [];
+    if (response) {
+      if ('data' in response && Array.isArray(response.data)) {
+        items = response.data;
+      } else if (Array.isArray(response)) {
+        items = response;
+      }
+    }
+    return items.map((kb) => ({
+      value: String(kb.id),
+      label: String(kb.name),
+    }));
+  }, [knowledgeBasesQuery.data]);
+
+  const onDiscover = handleFormSubmit((data) => {
+    setUrls([]);
+    setResults([]);
+    discoverUrls.mutate(data.url, {
+      onSuccess: (data) => {
+        setUrls(data);
+        setMode('discovery');
+        setSelectedUrls([]);
+      },
+    });
+  });
+
+  const onExtract = () => {
+    if (!selectedKb) {
+      notifications.show({ color: 'red', message: 'Select a Knowledge Base first' });
+      return;
+    }
+
+    // Close any existing connection
+    wsRef.current?.close();
+
+    setResults([]);
+    setIsExtracting(true);
+    setMode('extraction');
+    setWsStatus('connecting');
+
+    const ws = new WebSocket(WS_URL);
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      setWsStatus('open');
+      ws.send(JSON.stringify({ urls: selectedUrls }));
+    };
+
+    ws.onmessage = (event: MessageEvent<string>) => {
+      try {
+        const raw = JSON.parse(event.data) as unknown;
+        if (raw && typeof raw === 'object' && 'url' in raw) {
+          const msg = raw as Record<string, unknown>;
+          if (typeof msg.url === 'string') {
+            const urlStr = msg.url;
+            const resultStr = typeof msg.result === 'string' ? msg.result : '';
+            setResults((prev) => {
+              if (prev.some((r) => r.url === urlStr)) return prev;
+              return [...prev, { url: urlStr, result: resultStr }];
+            });
+          }
+        }
+      } catch (err) {
+        console.error('WS parse error:', err);
+      }
+    };
+
+    ws.onclose = () => {
+      setWsStatus('closed');
+      setIsExtracting(false);
+    };
+
+    ws.onerror = () => {
+      setWsStatus('closed');
+      setIsExtracting(false);
+      notifications.show({ color: 'red', message: 'WebSocket connection failed' });
+    };
+  };
+
+  const onIngest = () => {
+    if (!selectedKb) return;
+
+    const validResults = results
+      .filter((r) => Boolean(r.url) && Boolean(r.result))
+      .map((r) => ({ url: String(r.url), result: String(r.result) }));
+
+    if (validResults.length === 0) {
+      notifications.show({ color: 'red', message: 'No valid results to save' });
+      return;
+    }
+
+    ingestResults.mutate(
+      { id: selectedKb, results: validResults },
+      {
+        onSuccess: () => {
+          notifications.show({ color: 'green', message: 'Ingested successfully!' });
+          setResults([]);
+          setMode('initial');
+        },
+        onError: (err: Error) => {
+          notifications.show({
+            color: 'red',
+            title: 'Save Failed',
+            message: err.message || 'Error saving to knowledge base',
+          });
+        },
+      }
+    );
+  };
+
+  const statusColor: Record<WsStatus, string> = {
+    idle: 'gray',
+    connecting: 'blue',
+    open: 'green',
+    closed: 'red',
+  };
+
+  return (
+    <div className={cn(className, 'p-4')}>
+      <form onSubmit={onDiscover} className="flex gap-2 mb-6">
+        <TextInput {...register('url')} placeholder="URL to scrape" className="flex-1" radius="md" />
+        <Button type="submit" loading={discoverUrls.isPending} radius="md">
+          Discover
+        </Button>
+      </form>
+
+      {discoverUrls.isPending && <Loader size="sm" className="mb-4" />}
+
+      {mode !== 'initial' && (
+        <div className="space-y-4">
+          <div className="flex flex-wrap gap-4 items-center">
+            <Text size="sm">Found: {urls.length}</Text>
+            <Select
+              placeholder="Target Knowledge Base"
+              data={kbData}
+              value={selectedKb}
+              onChange={setSelectedKb}
+              className="w-64"
+            />
+            <Button
+              onClick={onExtract}
+              disabled={selectedUrls.length === 0 || isExtracting || !selectedKb}
+              radius="md"
+            >
+              {isExtracting ? 'Extracting...' : `Scrape & Ingest (${selectedUrls.length})`}
+            </Button>
+            {results.length > 0 && !isExtracting && (
+              <Button color="green" onClick={onIngest} loading={ingestResults.isPending} radius="md">
+                Save to KB
+              </Button>
+            )}
+            {mode === 'extraction' && (
+              <Badge color={statusColor[wsStatus]}>{wsStatus.toUpperCase()}</Badge>
+            )}
+          </div>
+
+          {isExtracting && (
+            <Progress
+              value={selectedUrls.length > 0 ? (results.length / selectedUrls.length) * 100 : 0}
+              animated
+            />
+          )}
+
+          {mode === 'discovery' && (
+            <Table>
+              <Table.Thead>
+                <Table.Tr>
+                  <Table.Th>
+                    <Checkbox onChange={(e) => setSelectedUrls(e.target.checked ? urls : [])} />
+                  </Table.Th>
+                  <Table.Th>URL</Table.Th>
+                </Table.Tr>
+              </Table.Thead>
+              <Table.Tbody>
+                {urls.map((url) => (
+                  <Table.Tr key={url}>
+                    <Table.Td>
+                      <Checkbox
+                        checked={selectedUrls.includes(url)}
+                        onChange={(e) =>
+                          setSelectedUrls((prev) =>
+                            e.target.checked ? [...prev, url] : prev.filter((u) => u !== url)
+                          )
+                        }
+                      />
+                    </Table.Td>
+                    <Table.Td>{url}</Table.Td>
+                  </Table.Tr>
+                ))}
+              </Table.Tbody>
+            </Table>
+          )}
+
+          {results.length > 0 && (
+            <Table>
+              <Table.Thead>
+                <Table.Tr>
+                  <Table.Th>URL</Table.Th>
+                  <Table.Th>Status</Table.Th>
+                </Table.Tr>
+              </Table.Thead>
+              <Table.Tbody>
+                {results.map((r) => (
+                  <Table.Tr key={r.url}>
+                    <Table.Td>{r.url}</Table.Td>
+                    <Table.Td>
+                      <Badge color="green">Extracted</Badge>
+                    </Table.Td>
+                  </Table.Tr>
+                ))}
+              </Table.Tbody>
+            </Table>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default WebIngester;
+
