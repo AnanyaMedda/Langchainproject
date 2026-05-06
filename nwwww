@@ -1,0 +1,18 @@
+knowledge_base = self.get_knowledge_base(id, user)
+        new_file_ids = [file.id for file in files_to_attach]
+
+        for file in files_to_attach:
+            await self.change_knowledge_base_file_status(
+                id, file.id, FileProcessingStatus.PENDING
+            )
+
+        extract_payload = ExtractPayload(
+            knowledge_base_id=knowledge_base.id,
+            file_ids=new_file_ids,
+        )
+        await self.kafka_producer.send_and_wait(
+            KafkaTopic.EXTRACT_DOCUMENT.value, value=extract_payload.model_dump(mode="json")
+        )
+        self.change_status(id, KnowledgeBaseStatus.PROCESSING)
+
+        return self.get_knowledge_base(id, user)
