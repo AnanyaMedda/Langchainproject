@@ -1,199 +1,82 @@
-knowledge_base = self.get_knowledge_base(id, user)
-        new_file_ids = [file.id for file in files_to_attach]
 
-        for file in files_to_attach:
-            await self.change_knowledge_base_file_status(
-                id, file.id, FileProcessingStatus.PENDING
-            )
-
-        extract_payload = ExtractPayload(
-            knowledge_base_id=knowledge_base.id,
-            file_ids=new_file_ids,
-        )
-        await self.kafka_producer.send_and_wait(
-            KafkaTopic.EXTRACT_DOCUMENT.value, value=extract_payload.model_dump(mode="json")
-        )
-        self.change_status(id, KnowledgeBaseStatus.PROCESSING)
-
-        return self.get_knowledge_base(id, user)
-
-
-@tool
-async def ingest_website(url: str, config: RunnableConfig, runtime: ToolRuntime[Context]):
-    """Extract content from a website URL, optionally discover up to 5 related pages from its sitemap, and ingest them directly into the Knowledge Base for future retrieval."""
-    import urllib.parse
-    from crawl4ai import AsyncWebCrawler
-    from src.models.models import User
-    from src.modules.scrapper.controller import ScrapeController
-    from src.modules.knowledge_base.schema import IngestScrapedRequest, ScrapedResultPayload
-    from src.core.logger import logger
-
-    parsed = urllib.parse.urlparse(url)
-    if not parsed.scheme or not parsed.netloc:
-        return f"Error: The provided URL '{url}' is invalid. Please give a valid URL starting with http:// or https://."
-
-    session = runtime.context.knowledge_base_controller.repository.session
-    scrape_controller = ScrapeController(session)
-    
-    # 1. Find sitemap URLs
-    try:
-        discovered_urls = scrape_controller.discover_urls_from_sitemap(url)
-    except Exception as e:
-        logger.warning(f"Sitemap discovery failed for {url}: {e}")
-        discovered_urls = []
-        
-    # If no sitemap or sitemap is empty, just use the provided URL
-    if not discovered_urls:
-        urls_to_scrape = [url]
-    else:
-        # Prioritize the requested url, then add up to 4 more from the sitemap
-        urls_to_scrape = [url]
-        for u in discovered_urls:
-            if u != url and len(urls_to_scrape) < 5:
-                urls_to_scrape.append(u)
-
-    scraped_results = []
-    
-    # 2. Scrape them using a single reusable crawler session
-    try:
-        async with AsyncWebCrawler() as crawler:
-            for target_url in urls_to_scrape:
-                try:
-                    result = await crawler.arun(url=target_url)
-                    scraped_results.append(
-                        ScrapedResultPayload(url=target_url, result=result.markdown)
-                    )
-                except Exception as e:
-                    logger.error(f"Failed to scrape {target_url}: {e}")
-    except Exception as e:
-        return f"Error initializing scraper: {e}"
-
-    if not scraped_results:
-        return f"Failed to scrape any content from {url} or its related pages."
-
-    # 3. Get the user object
-    user = session.get(User, runtime.context.user_id)
-    if not user:
-        return "Error: Could not authenticate user for ingestion."
-
-    # 4. Ingest the scraped results into the Knowledge Base
-    payload = IngestScrapedRequest(results=scraped_results)
-    try:
-        await runtime.context.knowledge_base_controller.ingest_scraped_results(
-            id=runtime.context.knowledge_base_id,
-            user=user,
-            payload=payload,
-            file_controller=runtime.context.file_controller
-        )
-    except Exception as e:
-        return f"Failed to ingest scraped content into the Knowledge Base: {e}"
-        
-    return (
-        f"Success: Scraped and queued {len(scraped_results)} pages (including {url}) "
-        f"for ingestion into the Knowledge Base. The content will be parsed and embedded shortly. "
-        f"You can now use the retrieve_context tool to search for information about it."
-    )
-@tool
-async def ingest_website(url: str, config: RunnableConfig, runtime: ToolRuntime[Context]):
-    """ONLY use this tool if the user explicitly provides a URL and asks you to ingest, scrape, add, or save a website to the Knowledge Base. DO NOT use this tool for general questions or if the user is just asking about a topic."""
-    import urllib.parse
+@app.task(name="scrape_and_ingest_url", base=BaseTask)
+def scrape_and_ingest_url(url: str, knowledge_base_id: str, user_id: str):
     from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode
-    from src.models.models import User
     from src.modules.scrapper.controller import ScrapeController
     from src.modules.knowledge_base.schema import IngestScrapedRequest, ScrapedResultPayload
-    from src.core.logger import logger
-
-    parsed = urllib.parse.urlparse(url)
-    if not parsed.scheme or not parsed.netloc:
-        return f"Error: The provided URL '{url}' is invalid. Please give a valid URL starting with http:// or https://."
-
-    session = runtime.context.knowledge_base_controller.repository.session
-    scrape_controller = ScrapeController(session)
+    from src.models.models import User
     
-    # 1. Find sitemap URLs
-    try:
-        discovered_urls = scrape_controller.discover_urls_from_sitemap(url)
-    except Exception as e:
-        logger.warning(f"Sitemap discovery failed for {url}: {e}")
-        discovered_urls = []
+    knowledge_base_id_uuid = UUID(str(knowledge_base_id))
+    user_id_uuid = UUID(str(user_id))
+
+    if ctx.loop is None:
+        raise Exception("Event loop not initialized.")
+
+    if ctx.kafka_producer is None:
+        raise Exception("Kafka Producer not initialized.")
+
+    if ctx.vector_db is None:
+        raise Exception("Vector DB not initialized.")
+
+    with db_session() as session:
+        knowledge_base_controller = ctx.factory.get_knowledge_base_controller(
+            db_session=session,
+            vector_db=ctx.vector_db,
+            kafka_producer=ctx.kafka_producer,
+        )
+        file_controller = ctx.factory.get_file_controller(db_session=session)
+        scrape_controller = ScrapeController(session)
         
-    # If no sitemap or sitemap is empty, just use the provided URL
-    if not discovered_urls:
-        urls_to_scrape = [url]
-    else:
-        # Prioritize the requested url, then add up to 4 more from the sitemap
+        user = session.get(User, user_id_uuid)
+        if not user:
+            logger.error(f"User {user_id} not found.")
+            return
+
+        # 1. Discover related URLs from sitemap
+        try:
+            discovered_urls = scrape_controller.discover_urls_from_sitemap(url)
+        except Exception as e:
+            logger.warning(f"Sitemap discovery failed: {e}")
+            discovered_urls = []
+            
         urls_to_scrape = [url]
         for u in discovered_urls:
             if u != url and len(urls_to_scrape) < 5:
                 urls_to_scrape.append(u)
 
-    scraped_results = []
-    
-    # 2. Configure the crawler for high-quality extraction
-    browser_config = BrowserConfig(
-        headless=True,
-    )
-
-    run_config = CrawlerRunConfig(
-        cache_mode=CacheMode.BYPASS,   # Always fetch fresh content
-        wait_for="css:body",           # Wait for the page body to load
-        remove_overlay_elements=True,  # Remove popups/modals
-        process_iframes=True,          # Pull content from iframes
-        magic=True                     # Automated handling of consent/popups
-    )
-
-    try:
-        async with AsyncWebCrawler(config=browser_config) as crawler:
-            for target_url in urls_to_scrape:
-                try:
-                    result = await crawler.arun(url=target_url, config=run_config)
-                    
-                    if result.success:
-                        # Extract clean content (handle both string and object markdown results)
-                        content = result.markdown
-                        if hasattr(content, "raw_markdown"):
-                            content = content.raw_markdown
-                        
-                        if not content:
-                            content = result.cleansed_html
-                            
-                        scraped_results.append(
-                            ScrapedResultPayload(url=target_url, result=content)
-                        )
-                    else:
-                        logger.error(f"Crawl failed for {target_url}: {result.error_message}")
-                except Exception as e:
-                    logger.error(f"Failed to scrape {target_url}: {e}")
-    except Exception as e:
-        return f"Error initializing scraper: {e}"
-
-    if not scraped_results:
-        return f"Failed to scrape any content from {url} or its related pages."
-
-    # 3. Get the user object
-    user = session.get(User, runtime.context.user_id)
-    if not user:
-        return "Error: Could not authenticate user for ingestion."
-
-    # 4. Ingest the scraped results into the Knowledge Base
-    payload = IngestScrapedRequest(results=scraped_results)
-    try:
-        await runtime.context.knowledge_base_controller.ingest_scraped_results(
-            id=runtime.context.knowledge_base_id,
-            user=user,
-            payload=payload,
-            file_controller=runtime.context.file_controller
-        )
-    except Exception as e:
-        return f"Failed to ingest scraped content into the Knowledge Base: {e}"
+        scraped_results = []
         
-    full_content = "\n\n---\n\n".join(
-        f"URL: {res.url}\nContent:\n{res.result}" for res in scraped_results
-    )
-    
-    return (
-        f"Success: Scraped and queued {len(scraped_results)} pages (including {url}) "
-        f"for ingestion into the Knowledge Base. The content will be parsed and embedded shortly.\n\n"
-        f"Here is the full extracted content from the pages:\n\n{full_content}"
-    )
+        # 2. Scrape all URLs
+        browser_config = BrowserConfig(headless=True)
+        run_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, wait_for="css:body", magic=True, remove_overlay_elements=True)
 
+        async def run_crawler():
+            async with AsyncWebCrawler(config=browser_config) as crawler:
+                for target_url in urls_to_scrape:
+                    try:
+                        result = await crawler.arun(url=target_url, config=run_config)
+                        if result.success:
+                            markdown_content = result.markdown.raw_markdown if hasattr(result.markdown, "raw_markdown") else result.markdown
+                            content = markdown_content or result.cleansed_html
+                            scraped_results.append(ScrapedResultPayload(url=target_url, result=content))
+                    except Exception as e:
+                        logger.error(f"Failed to scrape {target_url}: {e}")
+
+        ctx.loop.run_until_complete(run_crawler())
+
+        if not scraped_results:
+            logger.error(f"Failed to scrape any content from {url}.")
+            return
+
+        # 3. Save ALL results to Knowledge Base
+        try:
+            ctx.loop.run_until_complete(
+                knowledge_base_controller.ingest_scraped_results(
+                    id=knowledge_base_id_uuid,
+                    user=user,
+                    payload=IngestScrapedRequest(results=scraped_results),
+                    file_controller=file_controller
+                )
+            )
+        except Exception as e:
+            logger.error(f"KB Ingestion error: {e}")
