@@ -1,51 +1,23 @@
-webinges.tsx-
-import React, { useMemo, useState } from 'react';
-import { useForm } from 'react-hook-form';
-import {
-  Badge,
-  Button,
-  Checkbox,
-  Loader,
-  Select,
-  Table,
-  Text,
-  TextInput,
-  Alert,
-} from '@mantine/core';
-import { notifications } from '@mantine/notifications';
-import { Icon } from '@iconify/react';
 
-import { cn } from '@/lib/utils';
-import { useDiscoverUrls } from '@/apis/queries/scrapper.queries';
-import { useKnowledgeBases, useIngestUrls } from '@/apis/queries/knowledge-base.queries';
-import type { IKnowledgeBase } from '@/types';
+try:
+        result = controller.enqueue_url_scraping(id, user, body)
+        logger.info(f"Queued {result['count']} URL(s) for KB {id}")
+        return JSONResponse(content=result)
+    except Exception as exc:
+        logger.error(f"ingest-urls error: {exc}", exc_info=True)
+        raise
 
-const WebIngester = ({ className }: { className?: string }) => {
-  const [urls, setUrls] = useState<string[]>([]);
-  const [selectedUrls, setSelectedUrls] = useState<string[]>([]);
-  const [selectedKb, setSelectedKb] = useState<string | null>(null);
-  const [hasDiscovered, setHasDiscovered] = useState(false);
-  const [queuedUrls, setQueuedUrls] = useState<string[]>([]);
 
-  const { register, handleSubmit: handleFormSubmit } = useForm({
-    defaultValues: { url: 'https://' },
-  });
 
-  const discoverUrls = useDiscoverUrls();
-  const ingestUrls = useIngestUrls();
-  const knowledgeBasesQuery = useKnowledgeBases({ page: 0, limit: 100 });
 
-  const kbData = useMemo(() => {
-    const response = knowledgeBasesQuery.data as { data: IKnowledgeBase[] } | IKnowledgeBase[] | undefined;
-    let items: IKnowledgeBase[] = [];
-    if (response) {
-      if ('data' in response && Array.isArray(response.data)) {
-        items = response.data;
-      } else if (Array.isArray(response)) {
-        items = response;
-      }
-    }
-    return items.map((kb) => ({
+
+
+
+
+
+
+
+
       value: String(kb.id),
       label: String(kb.name),
     }));
