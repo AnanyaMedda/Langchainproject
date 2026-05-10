@@ -1,11 +1,72 @@
 
-try:
-        result = controller.enqueue_url_scraping(id, user, body)
-        logger.info(f"Queued {result['count']} URL(s) for KB {id}")
-        return JSONResponse(content=result)
-    except Exception as exc:
-        logger.error(f"ingest-urls error: {exc}", exc_info=True)
-        raise
+async def ingest_scraped_results(self, id: UUID, user: User, payload: IngestScrapedRequest, file_controller: FileController):
+        files_to_attach = []
+        for result in payload.results:
+            from urllib.parse import urlparse
+            parsed_url = urlparse(result.url)
+            # Create a simple filename from the url path, truncating to 100 max chars
+            path = parsed_url.path.strip("/").replace("/", "_") or "index"
+            base_name = f"{parsed_url.netloc}_{path}"[:100]
+            original_filename = f"{base_name}.md"
+
+            # Create file from scraped content
+            file = await file_controller.create_file_from_content(
+                user_id=user.id,
+                original_filename=original_filename,
+                content=result.result,
+                content_type="text/markdown"
+            )
+            files_to_attach.append(file)
+
+        # Attach the new files to the knowledge base
+        self.attach_file_to_knowledge_base(id, user, files_to_attach)
+
+        from src.celery.tasks import store_embeddings
+
+        for file, result in zip(files_to_attach, payload.results):
+            # Since content is already extracted, we mark it as EXTRACTED
+            await self.change_knowledge_base_file_status(
+                id, file.id, FileProcessingStatus.EXTRACTED
+            )
+            # Enqueue ONLY store_embeddings, skipping the parse_document extraction step
+            store_embeddings.delay(
+                content=result.result,
+                file_id=str(file.id),
+                knowledge_base_id=str(id)
+            )
+
+        self.change_status(id, KnowledgeBaseStatus.PROCESSING)
+
+        return self.get_knowledge_base(id, user)
+
+    def enqueue_url_scraping(self, id: UUID, user: User, payload: IngestUrlsRequest) -> dict:
+        """
+        Validate the target KB belongs to the user, then dispatch one Celery
+        ``scrape_and_ingest_url`` task per URL.  The tasks run entirely in the
+        background: they discover related URLs from the sitemap, crawl each page,
+        save the content as a file, and embed it — all without blocking the API.
+        """
+        knowledge_base = self.get_knowledge_base(id, user)
+
+        from src.celery.tasks import scrape_and_ingest_url
+
+        queued: list[str] = []
+        for url in payload.urls:
+            scrape_and_ingest_url.delay(
+                url=url,
+                knowledge_base_id=str(knowledge_base.id),
+                user_id=str(user.id),
+            )
+            queued.append(url)
+
+        # Mark KB as PROCESSING immediately so the UI reflects that work is in progress.
+        # Each Celery task will update individual file statuses; sync_knowledge_base_status
+        # will flip the KB to READY once all files are COMPLETED.
+        if queued:
+            self.change_status(id, KnowledgeBaseStatus.PROCESSING)
+
+        return {"queued": queued, "count": len(queued)}
+
 
 
 
