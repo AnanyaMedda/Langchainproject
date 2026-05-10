@@ -1,82 +1,321 @@
+webinges.tsx-
+import React, { useMemo, useState } from 'react';
+import { useForm } from 'react-hook-form';
+import {
+  Badge,
+  Button,
+  Checkbox,
+  Loader,
+  Select,
+  Table,
+  Text,
+  TextInput,
+  Alert,
+} from '@mantine/core';
+import { notifications } from '@mantine/notifications';
+import { Icon } from '@iconify/react';
 
-@app.task(name="scrape_and_ingest_url", base=BaseTask)
-def scrape_and_ingest_url(url: str, knowledge_base_id: str, user_id: str):
-    from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode
-    from src.modules.scrapper.controller import ScrapeController
-    from src.modules.knowledge_base.schema import IngestScrapedRequest, ScrapedResultPayload
-    from src.models.models import User
-    
-    knowledge_base_id_uuid = UUID(str(knowledge_base_id))
-    user_id_uuid = UUID(str(user_id))
+import { cn } from '@/lib/utils';
+import { useDiscoverUrls } from '@/apis/queries/scrapper.queries';
+import { useKnowledgeBases, useIngestUrls } from '@/apis/queries/knowledge-base.queries';
+import type { IKnowledgeBase } from '@/types';
 
-    if ctx.loop is None:
-        raise Exception("Event loop not initialized.")
+const WebIngester = ({ className }: { className?: string }) => {
+  const [urls, setUrls] = useState<string[]>([]);
+  const [selectedUrls, setSelectedUrls] = useState<string[]>([]);
+  const [selectedKb, setSelectedKb] = useState<string | null>(null);
+  const [hasDiscovered, setHasDiscovered] = useState(false);
+  const [queuedUrls, setQueuedUrls] = useState<string[]>([]);
 
-    if ctx.kafka_producer is None:
-        raise Exception("Kafka Producer not initialized.")
+  const { register, handleSubmit: handleFormSubmit } = useForm({
+    defaultValues: { url: 'https://' },
+  });
 
-    if ctx.vector_db is None:
-        raise Exception("Vector DB not initialized.")
+  const discoverUrls = useDiscoverUrls();
+  const ingestUrls = useIngestUrls();
+  const knowledgeBasesQuery = useKnowledgeBases({ page: 0, limit: 100 });
 
-    with db_session() as session:
-        knowledge_base_controller = ctx.factory.get_knowledge_base_controller(
-            db_session=session,
-            vector_db=ctx.vector_db,
-            kafka_producer=ctx.kafka_producer,
-        )
-        file_controller = ctx.factory.get_file_controller(db_session=session)
-        scrape_controller = ScrapeController(session)
-        
-        user = session.get(User, user_id_uuid)
-        if not user:
-            logger.error(f"User {user_id} not found.")
-            return
+  const kbData = useMemo(() => {
+    const response = knowledgeBasesQuery.data as { data: IKnowledgeBase[] } | IKnowledgeBase[] | undefined;
+    let items: IKnowledgeBase[] = [];
+    if (response) {
+      if ('data' in response && Array.isArray(response.data)) {
+        items = response.data;
+      } else if (Array.isArray(response)) {
+        items = response;
+      }
+    }
+    return items.map((kb) => ({
+      value: String(kb.id),
+      label: String(kb.name),
+    }));
+  }, [knowledgeBasesQuery.data]);
 
-        # 1. Discover related URLs from sitemap
-        try:
-            discovered_urls = scrape_controller.discover_urls_from_sitemap(url)
-        except Exception as e:
-            logger.warning(f"Sitemap discovery failed: {e}")
-            discovered_urls = []
-            
-        urls_to_scrape = [url]
-        for u in discovered_urls:
-            if u != url and len(urls_to_scrape) < 5:
-                urls_to_scrape.append(u)
+  const onDiscover = handleFormSubmit((data) => {
+    setUrls([]);
+    setSelectedUrls([]);
+    setQueuedUrls([]);
+    setHasDiscovered(false);
+    discoverUrls.mutate(data.url, {
+      onSuccess: (data) => {
+        setUrls(data);
+        setHasDiscovered(true);
+        setSelectedUrls([]);
+      },
+    });
+  });
 
-        scraped_results = []
-        
-        # 2. Scrape all URLs
-        browser_config = BrowserConfig(headless=True)
-        run_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, wait_for="css:body", magic=True, remove_overlay_elements=True)
+  const onQueue = () => {
+    if (!selectedKb) {
+      notifications.show({ color: 'red', message: 'Select a Knowledge Base first' });
+      return;
+    }
+    if (selectedUrls.length === 0) {
+      notifications.show({ color: 'red', message: 'Select at least one URL to scrape' });
+      return;
+    }
 
-        async def run_crawler():
-            async with AsyncWebCrawler(config=browser_config) as crawler:
-                for target_url in urls_to_scrape:
-                    try:
-                        result = await crawler.arun(url=target_url, config=run_config)
-                        if result.success:
-                            markdown_content = result.markdown.raw_markdown if hasattr(result.markdown, "raw_markdown") else result.markdown
-                            content = markdown_content or result.cleansed_html
-                            scraped_results.append(ScrapedResultPayload(url=target_url, result=content))
-                    except Exception as e:
-                        logger.error(f"Failed to scrape {target_url}: {e}")
+    ingestUrls.mutate(
+      { id: selectedKb, urls: selectedUrls },
+      {
+        onSuccess: (res) => {
+          setQueuedUrls(res.queued ?? selectedUrls);
+          notifications.show({
+            color: 'green',
+            title: 'Queued for background ingestion',
+            message: `${res.count} URL(s) are being scraped and ingested by Celery. Check the Knowledge Base for progress.`,
+          });
+          // Reset selection — the job is running in the background
+          setSelectedUrls([]);
+        },
+        onError: (err: Error) => {
+          notifications.show({
+            color: 'red',
+            title: 'Queue Failed',
+            message: err.message || 'Could not enqueue URLs',
+          });
+        },
+      }
+    );
+  };
 
-        ctx.loop.run_until_complete(run_crawler())
+  const canQueue = selectedUrls.length > 0 && !!selectedKb && !ingestUrls.isPending;
 
-        if not scraped_results:
-            logger.error(f"Failed to scrape any content from {url}.")
-            return
+  return (
+    <div className={cn(className, 'p-4 flex flex-col gap-4')}>
 
-        # 3. Save ALL results to Knowledge Base
-        try:
-            ctx.loop.run_until_complete(
-                knowledge_base_controller.ingest_scraped_results(
-                    id=knowledge_base_id_uuid,
-                    user=user,
-                    payload=IngestScrapedRequest(results=scraped_results),
-                    file_controller=file_controller
-                )
+      {/* Step 1: KB selector */}
+      <div className="flex flex-wrap gap-3 items-center">
+        <Text size="sm" fw={500}>Target Knowledge Base:</Text>
+        <Select
+          placeholder="Select a Knowledge Base"
+          data={kbData}
+          value={selectedKb}
+          onChange={setSelectedKb}
+          className="w-72"
+          searchable
+        />
+        {knowledgeBasesQuery.isLoading && <Loader size="xs" />}
+      </div>
+
+      {/* Step 2: URL discovery */}
+      <form onSubmit={onDiscover} className="flex gap-2">
+        <TextInput
+          {...register('url')}
+          placeholder="Enter website URL (e.g. https://example.com)"
+          className="flex-1"
+          radius="md"
+        />
+        <Button type="submit" loading={discoverUrls.isPending} radius="md">
+          Discover URLs
+        </Button>
+      </form>
+
+      {discoverUrls.isPending && (
+        <div className="flex items-center gap-2">
+          <Loader size="xs" />
+          <Text size="sm" c="dimmed">Scanning sitemap…</Text>
+        </div>
+      )}
+
+      {/* Step 3: URL selection + queue button */}
+      {hasDiscovered && (
+        <div className="flex flex-col gap-3">
+          <div className="flex flex-wrap gap-3 items-center">
+            <Text size="sm">
+              Found <strong>{urls.length}</strong> URL(s) — <strong>{selectedUrls.length}</strong> selected
+            </Text>
+
+            <div className="ml-auto flex gap-2">
+              <Button
+                onClick={onQueue}
+                disabled={!canQueue}
+                loading={ingestUrls.isPending}
+                leftSection={<Icon icon="solar:cloud-upload-bold-duotone" />}
+                radius="md"
+              >
+                {ingestUrls.isPending
+                  ? 'Queuing…'
+                  : `Queue for Ingestion (${selectedUrls.length})`}
+              </Button>
+            </div>
+          </div>
+
+          {/* Queued confirmation banner */}
+          {queuedUrls.length > 0 && (
+            <Alert
+              icon={<Icon icon="solar:check-circle-bold-duotone" />}
+              color="teal"
+              title="Background ingestion started"
+            >
+              {queuedUrls.length} URL(s) have been queued. Celery will scrape, extract, and embed the
+              content automatically — no further action needed. Check the Knowledge Base files for progress.
+            </Alert>
+          )}
+
+          {/* URL table — select which URLs to queue */}
+          <Table.ScrollContainer minWidth={400}>
+            <Table stickyHeader>
+              <Table.Thead>
+                <Table.Tr>
+                  <Table.Th>
+                    <Checkbox
+                      onChange={(e) => setSelectedUrls(e.target.checked ? urls : [])}
+                      checked={selectedUrls.length === urls.length && urls.length > 0}
+                      indeterminate={selectedUrls.length > 0 && selectedUrls.length < urls.length}
+                    />
+                  </Table.Th>
+                  <Table.Th>URL</Table.Th>
+                  <Table.Th>Status</Table.Th>
+                </Table.Tr>
+              </Table.Thead>
+              <Table.Tbody>
+                {urls.map((url) => {
+                  const isSelected = selectedUrls.includes(url);
+                  const isQueued = queuedUrls.includes(url);
+                  return (
+                    <Table.Tr key={url}>
+                      <Table.Td>
+                        <Checkbox
+                          disabled={isQueued}
+                          checked={isSelected}
+                          onChange={(e) =>
+                            setSelectedUrls((prev) =>
+                              e.target.checked ? [...prev, url] : prev.filter((u) => u !== url)
+                            )
+                          }
+                        />
+                      </Table.Td>
+                      <Table.Td style={{ wordBreak: 'break-all' }}>{url}</Table.Td>
+                      <Table.Td>
+                        {isQueued ? (
+                          <Badge color="teal">Queued</Badge>
+                        ) : isSelected ? (
+                          <Badge color="blue">Selected</Badge>
+                        ) : (
+                          <Badge color="gray">—</Badge>
+                        )}
+                      </Table.Td>
+                    </Table.Tr>
+                  );
+                })}
+              </Table.Tbody>
+            </Table>
+          </Table.ScrollContainer>
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default WebIngester;
+
+kb.queries-
+
+/**
+ * Queue URLs for background Celery scraping + KB ingestion.
+ * The API returns immediately; Celery handles the long-running work.
+ */
+export const useIngestUrls = () =>
+  useMutation<{ queued: string[]; count: number }, Error, { id: string; urls: string[] }>({
+    mutationFn: ({ id, urls }) => ingestUrls(id, urls),
+  });
+
+kb.req-
+
+/**
+ * Queue one or more URLs for background Celery scraping + KB ingestion.
+ * Returns immediately with { queued: string[], count: number }.
+ */
+export const ingestUrls = (id: string, urls: string[]) =>
+  http.post<{ queued: string[]; count: number }>(`/api/knowledge-base/${id}/ingest-urls`, { urls });
+
+router.py-
+@router.post(
+    "/{id}/ingest-urls",
+    response_model=dict,
+    dependencies=[guard("feature:knowledge-base")],
+)
+def enqueue_url_scraping(
+    user: CurrentUser,
+    controller: KnowledgeBaseControllerDeps,
+    id: UUID,
+    body: IngestUrlsRequest,
+):
+    """
+    Queue one Celery task per URL.  Each task independently:
+      1. Discovers related pages from the sitemap
+      2. Crawls & extracts markdown content
+      3. Saves a file to the KB
+      4. Generates and stores vector embeddings
+
+    Returns immediately with the list of queued URLs.
+    """
+    return controller.enqueue_url_scraping(id, user, body)
+schema.py-
+
+class IngestUrlsRequest(SQLModel):
+    """Request to queue one or more URLs for background scrape + KB ingestion via Celery."""
+    urls: list[str]
+    knowledge_base_id: str
+cotrolle.py-
+  from src.celery.tasks import store_embeddings
+
+        for file, result in zip(files_to_attach, payload.results):
+            # Since content is already extracted, we mark it as EXTRACTED
+            await self.change_knowledge_base_file_status(
+ id, file.id, FileProcessingStatus.EXTRACTED
             )
-        except Exception as e:
-            logger.error(f"KB Ingestion error: {e}")
+            # Enqueue ONLY store_embeddings, skipping the parse_document extraction step
+            store_embeddings.delay(
+                content=result.result,
+                file_id=str(file.id),
+                knowledge_base_id=str(id)
+            )
+
+        self.change_status(id, KnowledgeBaseStatus.PROCESSING)
+
+        return self.get_knowledge_base(id, user)
+
+    def enqueue_url_scraping(self, id: UUID, user: User, payload: IngestUrlsRequest) -> dict:
+        """
+        Validate the target KB belongs to the user, then dispatch one Celery
+        ``scrape_and_ingest_url`` task per URL.  The tasks run entirely in the
+        background: they discover related URLs from the sitemap, crawl each page,
+        save the content as a file, and embed it — all without blocking the API.
+        """
+        knowledge_base = self.get_knowledge_base(id, user)
+
+        from src.celery.tasks import scrape_and_ingest_url
+
+        queued: list[str] = []
+        for url in payload.urls:
+            scrape_and_ingest_url.delay(
+                url=url,
+                knowledge_base_id=str(knowledge_base.id),
+                user_id=str(user.id),
+            )
+            queued.append(url)
+
+        return {"queued": queued, "count": len(queued)}
+
