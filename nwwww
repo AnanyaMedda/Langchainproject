@@ -1,26 +1,18 @@
  # Primary config: give JS-rendered pages time to hydrate
+       # Primary config (crawl4ai 0.8.6 compatible)
         run_config = CrawlerRunConfig(
             cache_mode=CacheMode.BYPASS,
             magic=True,
             remove_overlay_elements=True,
-            delay_before_return_secs=3,
-            page_timeout=30000,
         )
-        # Aggressive retry config for pages that need more time
-        retry_config = CrawlerRunConfig(
-            cache_mode=CacheMode.BYPASS,
-            magic=True,
-            remove_overlay_elements=True,
-            delay_before_return_secs=6,
-            page_timeout=45000,
-        )
-  raw = result.markdown.raw_markdown if hasattr(result.markdown, "raw_markdown") else result.markdown
+         raw = result.markdown.raw_markdown if hasattr(result.markdown, "raw_markdown") else result.markdown
                             markdown_content = (raw or "").strip()
 
-                        # Retry with more aggressive config if content is too thin
+                        # Retry with longer wait if content is too thin
                         if len(markdown_content) < 200:
                             logger.warning(f"Thin content ({len(markdown_content)} chars) for {target_url}, retrying…")
-                            result = await crawler.arun(url=target_url, config=retry_config)
+                            await asyncio.sleep(6)
+                            result = await crawler.arun(url=target_url, config=run_config)
                             if result.success:
                                 raw = result.markdown.raw_markdown if hasattr(result.markdown, "raw_markdown") else result.markdown
                                 markdown_content = (raw or "").strip()
@@ -33,9 +25,6 @@
                             scraped_results.append(ScrapedResultPayload(url=target_url, result=markdown_content))
                         else:
                             logger.warning(f"No extractable content from {target_url} after retry — skipping.")
-
-
-
 
 async def ingest_scraped_results(self, id: UUID, user: User, payload: IngestScrapedRequest, file_controller: FileController):
         files_to_attach = []
