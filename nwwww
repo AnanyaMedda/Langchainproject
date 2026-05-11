@@ -1,3 +1,41 @@
+ # Primary config: give JS-rendered pages time to hydrate
+        run_config = CrawlerRunConfig(
+            cache_mode=CacheMode.BYPASS,
+            magic=True,
+            remove_overlay_elements=True,
+            delay_before_return_secs=3,
+            page_timeout=30000,
+        )
+        # Aggressive retry config for pages that need more time
+        retry_config = CrawlerRunConfig(
+            cache_mode=CacheMode.BYPASS,
+            magic=True,
+            remove_overlay_elements=True,
+            delay_before_return_secs=6,
+            page_timeout=45000,
+        )
+  raw = result.markdown.raw_markdown if hasattr(result.markdown, "raw_markdown") else result.markdown
+                            markdown_content = (raw or "").strip()
+
+                        # Retry with more aggressive config if content is too thin
+                        if len(markdown_content) < 200:
+                            logger.warning(f"Thin content ({len(markdown_content)} chars) for {target_url}, retrying…")
+                            result = await crawler.arun(url=target_url, config=retry_config)
+                            if result.success:
+                                raw = result.markdown.raw_markdown if hasattr(result.markdown, "raw_markdown") else result.markdown
+                                markdown_content = (raw or "").strip()
+
+                        # Fall back to cleaned HTML if markdown is still empty
+                        if not markdown_content and result.success:
+                            markdown_content = (result.cleaned_html or "").strip()
+
+                        if markdown_content:
+                            scraped_results.append(ScrapedResultPayload(url=target_url, result=markdown_content))
+                        else:
+                            logger.warning(f"No extractable content from {target_url} after retry — skipping.")
+
+
+
 
 async def ingest_scraped_results(self, id: UUID, user: User, payload: IngestScrapedRequest, file_controller: FileController):
         files_to_attach = []
