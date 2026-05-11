@@ -1,4 +1,32 @@
- # Primary config: give JS-rendered pages time to hydrate
+ # Still create a FAILED file entry in the KB so the user can see this URL was attempted
+            async def _mark_failed():
+                from urllib.parse import urlparse
+                parsed = urlparse(url)
+                path = parsed.path.strip("/").replace("/", "_") or "index"
+                base_name = f"{parsed.netloc}_{path}"[:100]
+                failed_file = await file_controller.create_file_from_content(
+                    user_id=user.id,
+                    original_filename=f"{base_name}.md",
+                    content=f"# Scrape Failed\n\nNo content could be extracted from: {url}",
+                    content_type="text/markdown",
+                )
+                knowledge_base_controller.attach_file_to_knowledge_base(
+                    knowledge_base_id_uuid, user, [failed_file]
+                )
+                await knowledge_base_controller.change_knowledge_base_file_status(
+                    knowledge_base_id_uuid,
+                    failed_file.id,
+                    FileProcessingStatus.FAILED,
+                    error="No extractable content found on this page.",
+                )
+            ctx.loop.run_until_complete(_mark_failed())
+
+
+
+
+
+
+# Primary config: give JS-rendered pages time to hydrate
        # Primary config (crawl4ai 0.8.6 compatible)
         run_config = CrawlerRunConfig(
             cache_mode=CacheMode.BYPASS,
