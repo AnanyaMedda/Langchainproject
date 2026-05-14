@@ -1,4 +1,126 @@
-<Tooltip label="Create new Knowledge Base" withArrow>
+import React, { useMemo, useState } from 'react';
+import { useForm } from 'react-hook-form';
+import {
+  Badge,
+  Button,
+  Checkbox,
+  Loader,
+  Modal,
+  Select,
+  Table,
+  Text,
+  TextInput,
+  Alert,
+  ActionIcon,
+  Tooltip,
+} from '@mantine/core';
+import { useDisclosure } from '@mantine/hooks';
+import { notifications } from '@mantine/notifications';
+import { Icon } from '@iconify/react';
+
+import { cn } from '@/lib/utils';
+import { useDiscoverUrls } from '@/apis/queries/scrapper.queries';
+import { useKnowledgeBases, useIngestUrls } from '@/apis/queries/knowledge-base.queries';
+import CreateKnowledgeBase from '@/components/modules/knowledge-bases/CreateKnowledgeBase';
+import type { IKnowledgeBase } from '@/types';
+
+const WebIngester = ({ className }: { className?: string }) => {
+  const [urls, setUrls] = useState<string[]>([]);
+  const [selectedUrls, setSelectedUrls] = useState<string[]>([]);
+  const [selectedKb, setSelectedKb] = useState<string | null>(null);
+  const [hasDiscovered, setHasDiscovered] = useState(false);
+  const [queuedUrls, setQueuedUrls] = useState<string[]>([]);
+  const [createModalOpened, createModalHandlers] = useDisclosure(false);
+
+  const { register, handleSubmit: handleFormSubmit } = useForm({
+    defaultValues: { url: 'https://' },
+  });
+
+  const discoverUrls = useDiscoverUrls();
+  const ingestUrls = useIngestUrls();
+  const knowledgeBasesQuery = useKnowledgeBases({ page: 0, limit: 100 });
+
+  const kbData = useMemo(() => {
+    const response = knowledgeBasesQuery.data as { data: IKnowledgeBase[] } | IKnowledgeBase[] | undefined;
+    let items: IKnowledgeBase[] = [];
+    if (response) {
+      if ('data' in response && Array.isArray(response.data)) {
+        items = response.data;
+      } else if (Array.isArray(response)) {
+        items = response;
+      }
+    }
+    return items.map((kb) => ({
+      value: String(kb.id),
+      label: String(kb.name),
+    }));
+  }, [knowledgeBasesQuery.data]);
+
+  const onDiscover = handleFormSubmit((data) => {
+    setUrls([]);
+    setSelectedUrls([]);
+    setQueuedUrls([]);
+    setHasDiscovered(false);
+    discoverUrls.mutate(data.url, {
+      onSuccess: (data) => {
+        setUrls(data);
+        setHasDiscovered(true);
+        setSelectedUrls([]);
+      },
+    });
+  });
+
+  const onQueue = () => {
+    if (!selectedKb) {
+      notifications.show({ color: 'red', message: 'Select a Knowledge Base first' });
+      return;
+    }
+    if (selectedUrls.length === 0) {
+      notifications.show({ color: 'red', message: 'Select at least one URL to scrape' });
+      return;
+    }
+
+    ingestUrls.mutate(
+      { id: selectedKb, urls: selectedUrls },
+      {
+        onSuccess: (res) => {
+          setQueuedUrls(res.queued ?? selectedUrls);
+          notifications.show({
+            color: 'green',
+            title: 'Queued for background ingestion',
+            message: `${res.count} URL(s) are being scraped and ingested by Celery. Check the Knowledge Base for progress.`,
+          });
+          // Reset selection — the job is running in the background
+          setSelectedUrls([]);
+        },
+        onError: (err: Error) => {
+          notifications.show({
+            color: 'red',
+            title: 'Queue Failed',
+            message: err.message || 'Could not enqueue URLs',
+          });
+        },
+      }
+    );
+  };
+
+  const canQueue = selectedUrls.length > 0 && !!selectedKb && !ingestUrls.isPending;
+
+  return (
+    <div className={cn(className, 'p-4 flex flex-col gap-4')}>
+
+      {/* Step 1: KB selector */}
+      <div className="flex flex-wrap gap-3 items-center">
+        <Text size="sm" fw={500}>Target Knowledge Base:</Text>
+        <Select
+          placeholder="Select a Knowledge Base"
+          data={kbData}
+          value={selectedKb}
+          onChange={setSelectedKb}
+          className="w-72"
+          searchable
+        />
+        <Tooltip label="Create new Knowledge Base" withArrow>
           <ActionIcon
             variant="light"
             size="lg"
@@ -8,7 +130,10 @@
             <Icon icon="solar:add-circle-bold-duotone" className="text-xl" />
           </ActionIcon>
         </Tooltip>
-{/* Create KB Modal */}
+        {knowledgeBasesQuery.isLoading && <Loader size="xs" />}
+      </div>
+
+      {/* Create KB Modal */}
       <Modal
         opened={createModalOpened}
         onClose={createModalHandlers.close}
@@ -23,6 +148,117 @@
         />
       </Modal>
 
+      {/* Step 2: URL discovery */}
+      <form onSubmit={onDiscover} className="flex gap-2">
+        <TextInput
+          {...register('url')}
+          placeholder="Enter website URL (e.g. https://example.com)"
+          className="flex-1"
+          radius="md"
+        />
+        <Button type="submit" loading={discoverUrls.isPending} radius="md">
+          Discover URLs
+        </Button>
+      </form>
+
+      {discoverUrls.isPending && (
+        <div className="flex items-center gap-2">
+          <Loader size="xs" />
+          <Text size="sm" c="dimmed">Scanning sitemap…</Text>
+        </div>
+      )}
+
+      {/* Step 3: URL selection + queue button */}
+      {hasDiscovered && (
+        <div className="flex flex-col gap-3">
+          <div className="flex flex-wrap gap-3 items-center">
+            <Text size="sm">
+              Found <strong>{urls.length}</strong> URL(s) — <strong>{selectedUrls.length}</strong> selected
+            </Text>
+
+            <div className="ml-auto flex gap-2">
+              <Button
+                onClick={onQueue}
+                disabled={!canQueue}
+                loading={ingestUrls.isPending}
+                leftSection={<Icon icon="solar:cloud-upload-bold-duotone" />}
+                radius="md"
+              >
+                {ingestUrls.isPending
+                  ? 'Queuing…'
+                  : `Queue for Ingestion (${selectedUrls.length})`}
+              </Button>
+            </div>
+          </div>
+
+          {/* Queued confirmation banner */}
+          {queuedUrls.length > 0 && (
+            <Alert
+              icon={<Icon icon="solar:check-circle-bold-duotone" />}
+              color="teal"
+              title="Background ingestion started"
+            >
+              {queuedUrls.length} URL(s) have been queued. Celery will scrape, extract, and embed the
+              content automatically — no further action needed. Check the Knowledge Base files for progress.
+            </Alert>
+          )}
+
+          {/* URL table — select which URLs to queue */}
+          <Table.ScrollContainer minWidth={400}>
+            <Table stickyHeader>
+              <Table.Thead>
+                <Table.Tr>
+                  <Table.Th>
+                    <Checkbox
+                      onChange={(e) => setSelectedUrls(e.target.checked ? urls : [])}
+                      checked={selectedUrls.length === urls.length && urls.length > 0}
+                      indeterminate={selectedUrls.length > 0 && selectedUrls.length < urls.length}
+                    />
+                  </Table.Th>
+                  <Table.Th>URL</Table.Th>
+                  <Table.Th>Status</Table.Th>
+                </Table.Tr>
+              </Table.Thead>
+              <Table.Tbody>
+                {urls.map((url) => {
+                  const isSelected = selectedUrls.includes(url);
+                  const isQueued = queuedUrls.includes(url);
+                  return (
+                    <Table.Tr key={url}>
+                      <Table.Td>
+                        <Checkbox
+                          disabled={isQueued}
+                          checked={isSelected}
+                          onChange={(e) =>
+                            setSelectedUrls((prev) =>
+                              e.target.checked ? [...prev, url] : prev.filter((u) => u !== url)
+                            )
+                          }
+                        />
+                      </Table.Td>
+                      <Table.Td style={{ wordBreak: 'break-all' }}>{url}</Table.Td>
+                      <Table.Td>
+                        {isQueued ? (
+                          <Badge color="teal">Queued</Badge>
+                        ) : isSelected ? (
+                          <Badge color="blue">Selected</Badge>
+                        ) : (
+                          <Badge color="gray">—</Badge>
+                        )}
+                      </Table.Td>
+                    </Table.Tr>
+                  );
+                })}
+              </Table.Tbody>
+            </Table>
+          </Table.ScrollContainer>
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default WebIngester;
 
 
 
