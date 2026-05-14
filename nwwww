@@ -1,4 +1,40 @@
- # Still create a FAILED file entry in the KB so the user can see this URL was attempted
+<Tooltip label="Create new Knowledge Base" withArrow>
+          <ActionIcon
+            variant="light"
+            size="lg"
+            onClick={createModalHandlers.open}
+            aria-label="Create new Knowledge Base"
+          >
+            <Icon icon="solar:add-circle-bold-duotone" className="text-xl" />
+          </ActionIcon>
+        </Tooltip>
+{/* Create KB Modal */}
+      <Modal
+        opened={createModalOpened}
+        onClose={createModalHandlers.close}
+        title="Create Knowledge Base"
+        centered
+      >
+        <CreateKnowledgeBase
+          onSubmit={(newId) => {
+            createModalHandlers.close();
+            setSelectedKb(newId);
+          }}
+        />
+      </Modal>
+
+
+
+
+
+
+
+
+
+
+
+
+# Still create a FAILED file entry in the KB so the user can see this URL was attempted
             async def _mark_failed():
                 from urllib.parse import urlparse
                 parsed = urlparse(url)
